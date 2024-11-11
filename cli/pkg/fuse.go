@@ -1,9 +1,11 @@
 package pkg
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strconv"
@@ -13,9 +15,11 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/ente-io/cli/internal/api"
+	"github.com/ente-io/cli/internal/crypto"
 	"github.com/ente-io/cli/pkg/mapper"
 	"github.com/ente-io/cli/pkg/model"
 	"github.com/ente-io/cli/utils/constants"
+	"github.com/ente-io/cli/utils/encoding"
 	"github.com/go-resty/resty/v2"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -39,12 +43,15 @@ type collectionNode struct {
 type imageNode struct {
 	fs.Inode
 	file   *model.RemoteFile
+	album  model.RemoteAlbum
 	root   *inMemoryFS
 	client resty.Client
 }
 
-var (
-	downloadHost = "https://files.ente.io/?fileID="
+const (
+	downloadHost                = "https://files.ente.io/?fileID="
+	decryptionBufferSize        = 4 * 1024 * 1024
+	XChaCha20Poly1305IetfABYTES = 16 + 1
 )
 
 func downloadUrl(fileID int64) string {
@@ -57,6 +64,59 @@ func downloadUrl(fileID int64) string {
 
 var _ = (fs.NodeOnAdder)((*inMemoryFS)(nil))
 var _ = (fs.FileReader)((*imageNode)(nil))
+var _ = (fs.NodeOpener)((*imageNode)(nil))
+var _ = (fs.NodeGetattrer)((*imageNode)(nil))
+
+func DecryptFile(reader io.Reader, out io.Writer, key, nonce []byte) error {
+
+	decryptor, err := crypto.NewDecryptor(key, nonce)
+	if err != nil {
+		return err
+	}
+
+	buf := make([]byte, decryptionBufferSize+XChaCha20Poly1305IetfABYTES)
+	for {
+		readCount, err := reader.Read(buf)
+		if err != nil && err != io.EOF {
+			log.Println("Failed to read from input file", err)
+			return err
+		}
+		if readCount == 0 {
+			break
+		}
+		n, tag, errErr := decryptor.Pull(buf[:readCount])
+		if errErr != nil && errErr != io.EOF {
+			log.Println("Failed to read from decoder", errErr)
+			return errErr
+		}
+
+		if _, err := out.Write(n); err != nil {
+			log.Println("Failed to write to output file", err)
+			return err
+		}
+		if errErr == io.EOF {
+			break
+		}
+		if tag == crypto.TagFinal {
+			break
+		}
+	}
+	return nil
+}
+
+func (in *imageNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	out.Size = uint64(in.file.Info.FileSize)
+	out.Mtime = uint64(in.file.LastUpdateTime)
+	return 0
+}
+
+func (in *imageNode) Open(ctx context.Context, openFlags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	// disallow writes
+	if fuseFlags&(syscall.O_RDWR|syscall.O_WRONLY) != 0 {
+		return nil, 0, syscall.EROFS
+	}
+	return in, fuse.FOPEN_KEEP_CACHE, 0
+}
 
 func (in *imageNode) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	ctx = context.WithValue(ctx, "app", string(in.root.account.App))
@@ -64,6 +124,7 @@ func (in *imageNode) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 	ctx = context.WithValue(ctx, "user_id", in.root.account.UserID)
 
 	var url = downloadUrl(in.file.ID)
+	log.Print(url)
 	req := in.client.R().
 		SetContext(ctx).
 		SetHeader("X-Auth-Token", in.root.token).
@@ -75,14 +136,18 @@ func (in *imageNode) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 
 	body := r.RawBody()
 	defer body.Close()
-	end := off + int64(len(dest))
-	var fileBytes = make([]byte, end)
-	body.Read(fileBytes)
-	if end > int64(len(fileBytes)) {
-		end = int64(len(fileBytes))
+	var fileBytes = bytes.NewBuffer(make([]byte, in.file.Info.FileSize))
+	err = DecryptFile(
+		body,
+		fileBytes,
+		in.file.Key.MustDecrypt(in.root.c.KeyHolder.DeviceKey),
+		encoding.DecodeBase64(in.file.FileNonce),
+	)
+	if err != nil {
+		return nil, syscall.EIO
 	}
 
-	return fuse.ReadResultData(fileBytes[off:end]), 0
+	return fuse.ReadResultData(fileBytes.Bytes()[off : int(off)+len(dest)]), 0
 }
 
 // OnAdd is called on mounting the file system. Use it to populate
@@ -114,7 +179,7 @@ func (root *inMemoryFS) OnAdd(ctx context.Context) {
 			fs.StableAttr{Mode: syscall.S_IFDIR, Ino: uint64(album.ID)})
 		idMap[uint64(album.ID)] = c
 		p.AddChild(album.AlbumName, d, true)
-		addImages(ctx, root, d, c)
+		go addImages(ctx, root, d, c)
 	}
 }
 
@@ -130,13 +195,15 @@ func addImages(ctx context.Context, root *inMemoryFS, iNode *fs.Inode, cn *colle
 			log.Panic(err)
 		}
 		for n, file := range files {
+			if file.IsDeleted || file.IsRemovedFromAlbum() {
+				continue
+			}
 			photoFile, err := mapper.MapApiFileToPhotoFile(ctx, cn.album, file, root.c.KeyHolder)
 			if err != nil {
 				log.Printf("err %v", err)
 				continue
 			}
 			var i = &imageNode{file: photoFile, root: root, client: *client}
-			log.Printf("file %+v", photoFile.Metadata)
 			var f = iNode.NewPersistentInode(ctx, i, fs.StableAttr{Mode: syscall.S_IFREG, Ino: uint64(file.ID)})
 			iNode.AddChild(photoFile.GetTitle(), f, true)
 			if n > 150 {
