@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/spf13/viper"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"syscall"
 
-	"github.com/ente-io/cli/internal/api"
+	"github.com/ente-io/cli/pkg/mapper"
 	"github.com/ente-io/cli/pkg/model"
+	"github.com/ente-io/cli/utils/constants"
+	"github.com/go-resty/resty/v2"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -20,19 +24,64 @@ type inMemoryFS struct {
 	fs.Inode
 	c       *ClICtrl
 	account *model.Account
+	token   string
 }
 
 type collectionNode struct {
 	fs.Inode
-	root *inMemoryFS
+	root  *inMemoryFS
+	album model.RemoteAlbum
+	files []*int
 }
 
 type imageNode struct {
 	fs.Inode
-	file api.File
+	file   *model.RemoteFile
+	root   *inMemoryFS
+	client resty.Client
+}
+
+var (
+	downloadHost = "https://files.ente.io/?fileID="
+)
+
+func downloadUrl(fileID int64) string {
+	apiEndpoint := viper.GetString("endpoint.api")
+	if apiEndpoint == "" || strings.Compare(apiEndpoint, constants.EnteApiUrl) == 0 {
+		return downloadHost + strconv.FormatInt(fileID, 10)
+	}
+	return apiEndpoint + "/files/download/" + strconv.FormatInt(fileID, 10)
 }
 
 var _ = (fs.NodeOnAdder)((*inMemoryFS)(nil))
+var _ = (fs.FileReader)((*imageNode)(nil))
+
+func (in *imageNode) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	ctx = context.WithValue(ctx, "app", string(in.root.account.App))
+	ctx = context.WithValue(ctx, "account_key", in.root.account.AccountKey())
+	ctx = context.WithValue(ctx, "user_id", in.root.account.UserID)
+
+	var url = downloadUrl(in.file.ID)
+	req := in.client.R().
+		SetContext(ctx).
+		SetHeader("X-Auth-Token", in.root.token).
+		SetDoNotParseResponse(true)
+	r, err := req.Get(url)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+
+	body := r.RawBody()
+	defer body.Close()
+	end := off + int64(len(dest))
+	var fileBytes = make([]byte, end)
+	body.Read(fileBytes)
+	if end > int64(len(fileBytes)) {
+		end = int64(len(fileBytes))
+	}
+
+	return fuse.ReadResultData(fileBytes[off:end]), 0
+}
 
 // OnAdd is called on mounting the file system. Use it to populate
 // the file system tree.
@@ -47,30 +96,46 @@ func (root *inMemoryFS) OnAdd(ctx context.Context) {
 	if err != nil {
 		log.Panic(err)
 	}
-	var idMap = make(map[uint64]*fs.Inode)
+	var idMap = make(map[uint64]*collectionNode)
 	for _, album := range albums {
+		if album.IsDeleted {
+			continue
+		}
 		if err != nil {
 			log.Panic(err)
 		}
 		var c = &collectionNode{
-			root: root,
+			root:  root,
+			album: album,
 		}
 		var d = p.NewPersistentInode(ctx, c,
 			fs.StableAttr{Mode: syscall.S_IFDIR, Ino: uint64(album.ID)})
-		idMap[uint64(album.ID)] = d
+		idMap[uint64(album.ID)] = c
 		p.AddChild(album.AlbumName, d, true)
 	}
 
 	// Add images
 	entries, err := root.c.getRemoteAlbumEntries(ctx)
+	client := resty.New()
 	if err != nil {
 		log.Panic(err)
 	}
-	for _, image := range entries {
-		var albumNode = idMap[uint64(image.AlbumID)]
-		var i = &imageNode{}
-		var f = albumNode.NewPersistentInode(ctx, i, fs.StableAttr{Mode: syscall.S_IFREG, Ino: uint64(image.FileID)})
-		albumNode.AddChild(strconv.FormatInt(image.FileID, 17), f, true)
+	for n, image := range entries {
+		var cn = idMap[uint64(image.AlbumID)]
+		var cnNode = cn.EmbeddedInode()
+		file, err := root.c.Client.GetFile(ctx, image.AlbumID, image.FileID)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		photoFile, err := mapper.MapApiFileToPhotoFile(ctx, cn.album, *file, root.c.KeyHolder)
+		var i = &imageNode{file: photoFile, root: root, client: *client}
+		log.Printf("file %+v", photoFile.Metadata)
+		var f = cnNode.NewPersistentInode(ctx, i, fs.StableAttr{Mode: syscall.S_IFREG, Ino: uint64(image.FileID)})
+		cnNode.AddChild(photoFile.GetTitle(), f, true)
+		if n > 150 {
+			break
+		}
 	}
 }
 
@@ -87,7 +152,8 @@ func (c *ClICtrl) Mount() error {
 	}
 	var account = accounts[0]
 	secretInfo, err := c.KeyHolder.LoadSecrets(account)
-	c.Client.AddToken(account.AccountKey(), base64.URLEncoding.EncodeToString(secretInfo.Token))
+	token := base64.URLEncoding.EncodeToString(secretInfo.Token)
+	c.Client.AddToken(account.AccountKey(), token)
 	if err != nil {
 		return err
 	}
@@ -95,6 +161,7 @@ func (c *ClICtrl) Mount() error {
 	mntDir, _ := os.MkdirTemp("", "")
 	root := &inMemoryFS{
 		account: &account,
+		token:   token,
 		c:       c,
 	}
 	server, err := fs.Mount(mntDir, root, &fs.Options{
