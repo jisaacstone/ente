@@ -4,13 +4,15 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"github.com/spf13/viper"
 	"log"
 	"os"
 	"strconv"
 	"strings"
 	"syscall"
 
+	"github.com/spf13/viper"
+
+	"github.com/ente-io/cli/internal/api"
 	"github.com/ente-io/cli/pkg/mapper"
 	"github.com/ente-io/cli/pkg/model"
 	"github.com/ente-io/cli/utils/constants"
@@ -112,30 +114,36 @@ func (root *inMemoryFS) OnAdd(ctx context.Context) {
 			fs.StableAttr{Mode: syscall.S_IFDIR, Ino: uint64(album.ID)})
 		idMap[uint64(album.ID)] = c
 		p.AddChild(album.AlbumName, d, true)
+		addImages(ctx, root, d, c)
 	}
+}
 
+func addImages(ctx context.Context, root *inMemoryFS, iNode *fs.Inode, cn *collectionNode) {
 	// Add images
-	entries, err := root.c.getRemoteAlbumEntries(ctx)
+	var hasNext = true
+	var err error
+	var files []api.File
 	client := resty.New()
-	if err != nil {
-		log.Panic(err)
-	}
-	for n, image := range entries {
-		var cn = idMap[uint64(image.AlbumID)]
-		var cnNode = cn.EmbeddedInode()
-		file, err := root.c.Client.GetFile(ctx, image.AlbumID, image.FileID)
+	for hasNext {
+		files, hasNext, err = root.c.Client.GetFiles(ctx, cn.album.ID, 0)
 		if err != nil {
-			log.Println(err)
-			continue
+			log.Panic(err)
 		}
-		photoFile, err := mapper.MapApiFileToPhotoFile(ctx, cn.album, *file, root.c.KeyHolder)
-		var i = &imageNode{file: photoFile, root: root, client: *client}
-		log.Printf("file %+v", photoFile.Metadata)
-		var f = cnNode.NewPersistentInode(ctx, i, fs.StableAttr{Mode: syscall.S_IFREG, Ino: uint64(image.FileID)})
-		cnNode.AddChild(photoFile.GetTitle(), f, true)
-		if n > 150 {
-			break
+		for n, file := range files {
+			photoFile, err := mapper.MapApiFileToPhotoFile(ctx, cn.album, file, root.c.KeyHolder)
+			if err != nil {
+				log.Printf("err %v", err)
+				continue
+			}
+			var i = &imageNode{file: photoFile, root: root, client: *client}
+			log.Printf("file %+v", photoFile.Metadata)
+			var f = iNode.NewPersistentInode(ctx, i, fs.StableAttr{Mode: syscall.S_IFREG, Ino: uint64(file.ID)})
+			iNode.AddChild(photoFile.GetTitle(), f, true)
+			if n > 150 {
+				break
+			}
 		}
+		break
 	}
 }
 
